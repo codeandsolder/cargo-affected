@@ -39,8 +39,8 @@ pub(crate) struct Fingerprint {
 /// A single named input contributing to the composite fingerprint.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct FingerprintComponent {
-    /// Stable label (`cargo_lock`, `manifest:Cargo.toml`, `rustc`,
-    /// `RUSTFLAGS`, `CARGO_BUILD_TARGET`).
+    /// Stable label (`coverage_path_basis`, `cargo_lock`,
+    /// `manifest:Cargo.toml`, `rustc`, `RUSTFLAGS`, `CARGO_BUILD_TARGET`).
     pub(crate) label: String,
     /// SHA-256 hex digest of this component's bytes alone.
     pub(crate) hash: String,
@@ -81,7 +81,15 @@ pub(crate) fn compute(project: &ProjectRoot) -> Result<Fingerprint> {
 /// the hex digest of an otherwise unchanged environment.
 fn collect_inputs(project: &ProjectRoot) -> Result<Vec<(String, Vec<u8>)>> {
     let mut inputs: Vec<(String, Vec<u8>)> =
-        Vec::with_capacity(2 + project.manifest_paths.len() + 3);
+        Vec::with_capacity(3 + project.manifest_paths.len() + 3);
+
+    // Coverage source paths used to be workspace-relative; old SQLite maps
+    // cannot be interpreted using Git-root paths. Also differentiate a
+    // workspace moved under a different subdirectory of the same Git repo.
+    let relative_workspace = &project.git_prefix;
+    let mut path_basis = b"git-root-v2/".to_vec();
+    path_basis.extend(relative_workspace.to_string_lossy().as_bytes());
+    inputs.push(("coverage_path_basis".to_string(), path_basis));
 
     inputs.push((
         "cargo_lock".to_string(),
@@ -226,6 +234,8 @@ mod tests {
 
     fn project_with(workspace_root: PathBuf, manifests: Vec<PathBuf>) -> ProjectRoot {
         ProjectRoot {
+            git_root: workspace_root.clone(),
+            git_prefix: PathBuf::new(),
             workspace_root,
             manifest_paths: manifests,
             metadata: serde_json::Value::Null,
@@ -378,6 +388,7 @@ mod tests {
         assert_eq!(
             labels,
             vec![
+                "coverage_path_basis",
                 "cargo_lock",
                 "manifest:Cargo.toml",
                 "manifest:crates/foo/Cargo.toml",

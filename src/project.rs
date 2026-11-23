@@ -48,8 +48,6 @@ use std::process::Command;
 use anyhow::{bail, Context, Result};
 use camino::Utf8PathBuf;
 
-use crate::coverage::to_db_relative;
-
 /// Inclusive line range `[start, end]` of a changed hunk in some file.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) struct LineRange {
@@ -84,7 +82,12 @@ pub(crate) enum ShaRelation {
 
 /// Project root information.
 pub(crate) struct ProjectRoot {
-    /// Workspace root directory. Git operations and the DB live here.
+    /// Git repository root. Git diffs are relative to this directory even
+    /// when Cargo's workspace is nested further down.
+    pub(crate) git_root: PathBuf,
+    /// Workspace path as Git spells it relative to the repository root.
+    pub(crate) git_prefix: PathBuf,
+    /// Workspace root directory. The coverage DB and Cargo builds live here.
     /// For single-crate projects this equals the crate root.
     pub(crate) workspace_root: PathBuf,
     /// All Cargo.toml files belonging to the workspace — the root manifest
@@ -142,6 +145,31 @@ pub(crate) fn find_project_root() -> Result<ProjectRoot> {
         .as_str()
         .context("cargo metadata missing workspace_root")?;
     let workspace_root = PathBuf::from(workspace_root);
+    // Git expands Windows 8.3 names in absolute toplevel paths while
+    // Cargo and LLVM preserve them. Derive the physical root from Cargo's
+    // spelling and Git's relative directory prefix instead.
+    let prefix_output = Command::new("git")
+        .args(["rev-parse", "--show-prefix"])
+        .current_dir(&workspace_root)
+        .output()
+        .context("failed to determine Git workspace prefix")?;
+    if !prefix_output.status.success() {
+        bail!(
+            "git rev-parse --show-prefix failed: {}",
+            String::from_utf8_lossy(&prefix_output.stderr).trim()
+        );
+    }
+    let git_prefix = PathBuf::from(
+        std::str::from_utf8(&prefix_output.stdout)
+            .context("Git prefix was not UTF-8")?
+            .trim(),
+    );
+    let mut git_root = workspace_root.clone();
+    for component in git_prefix.components() {
+        if !matches!(component, std::path::Component::Normal(_)) || !git_root.pop() {
+            bail!("invalid Git workspace prefix");
+        }
+    }
 
     let mut manifest_paths: Vec<PathBuf> = meta["packages"]
         .as_array()
@@ -164,6 +192,8 @@ pub(crate) fn find_project_root() -> Result<ProjectRoot> {
     manifest_paths.sort();
 
     Ok(ProjectRoot {
+        git_root,
+        git_prefix,
         workspace_root,
         manifest_paths,
         metadata: meta,
@@ -199,14 +229,8 @@ impl ProjectRoot {
     pub(crate) fn crate_root_sentinels_by_binary_id(
         &self,
     ) -> Result<BTreeMap<String, BTreeSet<Utf8PathBuf>>> {
-        // No canonicalize: `workspace_root` and `target.src_path` both come
-        // from the same `cargo metadata` invocation and share whatever
-        // normalisation cargo applied. Calling `Path::canonicalize` here
-        // would diverge on Windows (verbatim `\\?\` prefix, 8.3 → long-name
-        // expansion of `RUNNER~1` → `runneradmin`) and the strip_prefix
-        // below would silently drop every target.
-        let root = &self.workspace_root;
-
+        // Paths must stay in Cargo's physical spelling and use the Git
+        // repository-relative prefix when persisted as coverage ranges.
         let Some(packages) = self.metadata.get("packages").and_then(|v| v.as_array()) else {
             return Ok(BTreeMap::new());
         };
@@ -228,7 +252,12 @@ impl ProjectRoot {
             };
             if let Some(target_arr) = pkg.get("targets").and_then(|v| v.as_array()) {
                 for target in target_arr {
-                    if let Some(parsed) = parse_target(target, root) {
+                    if let Some(parsed) = parse_target(
+                        target,
+                        &self.workspace_root,
+                        &self.git_root,
+                        &self.git_prefix,
+                    ) {
                         // Recorded regardless of `runs_tests`, because the two
                         // roles are independent: a `[lib] test = false` lib
                         // builds no test harness of its own, but every other
@@ -350,7 +379,12 @@ const LIB_CRATE_TYPES: &[&str] = &["lib", "rlib", "dylib", "cdylib", "staticlib"
 /// Cargo's `test` flag is carried through rather than filtered on: a target
 /// with `test = false` still compiles into its package's other targets, so
 /// dropping it here would lose its crate root as a sentinel.
-fn parse_target(target: &serde_json::Value, root: &Path) -> Option<TestTarget> {
+fn parse_target(
+    target: &serde_json::Value,
+    workspace_root: &Path,
+    git_root: &Path,
+    git_prefix: &Path,
+) -> Option<TestTarget> {
     let kinds: Vec<&str> = target
         .get("kind")
         .and_then(|v| v.as_array())
@@ -369,8 +403,8 @@ fn parse_target(target: &serde_json::Value, root: &Path) -> Option<TestTarget> {
     };
     let name = target.get("name").and_then(|v| v.as_str())?.to_string();
     let abs = target.get("src_path").and_then(|v| v.as_str())?;
-    let rel = Path::new(abs).strip_prefix(root).ok()?;
-    let src_path = to_db_relative(rel)?;
+    let src_path =
+        crate::coverage::to_git_relative(Path::new(abs), workspace_root, git_root, git_prefix)?;
     let runs_tests = target
         .get("test")
         .and_then(|v| v.as_bool())
@@ -441,7 +475,13 @@ pub(crate) fn git_changed_files(project_root: &Path) -> Result<Vec<String>> {
             "--cached",
             "-z",
         ],
-        vec!["ls-files", "-z", "--others", "--exclude-standard"],
+        vec![
+            "ls-files",
+            "--full-name",
+            "-z",
+            "--others",
+            "--exclude-standard",
+        ],
     ] {
         for path in run_git(project_root, &args)? {
             if !files.contains(&path) {
@@ -844,6 +884,19 @@ mod tests {
             files.iter().any(|f| f == "new.txt"),
             "expected new.txt in {files:?}"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn nested_repository_untracked_files_keep_git_root_prefix() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        init_repo(dir.path())?;
+        let member = dir.path().join("member");
+        std::fs::create_dir_all(member.join("src"))?;
+        std::fs::write(member.join("src/new.rs"), b"pub fn new() {}\n")?;
+
+        let paths = git_changed_files(&member)?;
+        assert_eq!(paths, vec!["member/src/new.rs"]);
         Ok(())
     }
 
@@ -1319,6 +1372,8 @@ mod tests {
         });
 
         let project = ProjectRoot {
+            git_root: root.clone(),
+            git_prefix: PathBuf::new(),
             workspace_root: root.clone(),
             manifest_paths: vec![],
             metadata,
@@ -1426,6 +1481,8 @@ mod tests {
         });
 
         let project = ProjectRoot {
+            git_root: root.clone(),
+            git_prefix: PathBuf::new(),
             workspace_root: root.clone(),
             manifest_paths: vec![],
             metadata,
@@ -1515,6 +1572,8 @@ mod tests {
         });
 
         let project = ProjectRoot {
+            git_root: root.clone(),
+            git_prefix: PathBuf::new(),
             workspace_root: root.clone(),
             manifest_paths: vec![],
             metadata,
