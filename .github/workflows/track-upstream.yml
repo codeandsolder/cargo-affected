@@ -1,0 +1,26 @@
+name: Track upstream source
+
+on:
+  schedule:
+    - cron: "23 5 * * *"
+  workflow_dispatch:
+
+# Upstream source may be updated only after the shared observer has seen a
+# reachable revision for at least 72 hours. Upstream workflow edits must
+# never bypass manual review.
+permissions:
+  contents: write
+  issues: write
+
+jobs:
+  sync:
+    uses: codeandsolder/ci-workflows/.github/workflows/upstream-tracking.yml@bf0a56b897a722e474561d94dcb12485f1e14e41
+    with:
+      upstream-repository: max-sixty/cargo-affected
+      upstream-branch: main
+      target-branch: main
+      strategy: merge
+      workflow-policy: preserve
+      validation-script: .github/workflows/validate-upstream.sh
+      rust-toolchain: "1.100.0"
+      timeout-minutes: 90
