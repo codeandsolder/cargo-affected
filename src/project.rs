@@ -84,7 +84,7 @@ pub(crate) enum ShaRelation {
 pub(crate) struct ProjectRoot {
     /// Git repository root. Git diffs are relative to this directory even
     /// when Cargo's workspace is nested further down.
-    pub(crate) git_root: PathBuf,
+    pub(crate) git_root: Option<PathBuf>,
     /// Workspace path as Git spells it relative to the repository root.
     pub(crate) git_prefix: PathBuf,
     /// Workspace root directory. The coverage DB and Cargo builds live here.
@@ -153,23 +153,25 @@ pub(crate) fn find_project_root() -> Result<ProjectRoot> {
         .current_dir(&workspace_root)
         .output()
         .context("failed to determine Git workspace prefix")?;
-    if !prefix_output.status.success() {
-        bail!(
-            "git rev-parse --show-prefix failed: {}",
-            String::from_utf8_lossy(&prefix_output.stderr).trim()
+    // Root discovery also serves cache-miss run/status, which need not be
+    // inside Git (e.g. a source archive). No-Git has a distinct fingerprint
+    // and collect still requires a real repository to anchor coverage.
+    let (git_root, git_prefix) = if prefix_output.status.success() {
+        let git_prefix = PathBuf::from(
+            std::str::from_utf8(&prefix_output.stdout)
+                .context("Git prefix was not UTF-8")?
+                .trim_end_matches(['\r', '\n']),
         );
-    }
-    let git_prefix = PathBuf::from(
-        std::str::from_utf8(&prefix_output.stdout)
-            .context("Git prefix was not UTF-8")?
-            .trim(),
-    );
-    let mut git_root = workspace_root.clone();
-    for component in git_prefix.components() {
-        if !matches!(component, std::path::Component::Normal(_)) || !git_root.pop() {
-            bail!("invalid Git workspace prefix");
+        let mut git_root = workspace_root.clone();
+        for component in git_prefix.components() {
+            if !matches!(component, std::path::Component::Normal(_)) || !git_root.pop() {
+                bail!("invalid Git workspace prefix");
+            }
         }
-    }
+        (Some(git_root), git_prefix)
+    } else {
+        (None, PathBuf::new())
+    };
 
     let mut manifest_paths: Vec<PathBuf> = meta["packages"]
         .as_array()
@@ -231,6 +233,10 @@ impl ProjectRoot {
     ) -> Result<BTreeMap<String, BTreeSet<Utf8PathBuf>>> {
         // Paths must stay in Cargo's physical spelling and use the Git
         // repository-relative prefix when persisted as coverage ranges.
+        let git_root = self
+            .git_root
+            .as_deref()
+            .context("coverage collection requires a Git repository")?;
         let Some(packages) = self.metadata.get("packages").and_then(|v| v.as_array()) else {
             return Ok(BTreeMap::new());
         };
@@ -252,12 +258,9 @@ impl ProjectRoot {
             };
             if let Some(target_arr) = pkg.get("targets").and_then(|v| v.as_array()) {
                 for target in target_arr {
-                    if let Some(parsed) = parse_target(
-                        target,
-                        &self.workspace_root,
-                        &self.git_root,
-                        &self.git_prefix,
-                    ) {
+                    if let Some(parsed) =
+                        parse_target(target, &self.workspace_root, git_root, &self.git_prefix)
+                    {
                         // Recorded regardless of `runs_tests`, because the two
                         // roles are independent: a `[lib] test = false` lib
                         // builds no test harness of its own, but every other
@@ -460,15 +463,23 @@ fn transitive_closure<'a>(
 /// List files changed in the working tree relative to HEAD: staged + unstaged
 /// + untracked.
 ///
-/// Returns paths relative to the project root. A non-zero git exit (corrupt
+/// Returns paths relative to the Git root. A non-zero git exit (corrupt
 /// repo, missing object, permissions) is a hard error: silently returning "no
 /// changed files" would look like a clean tree and select zero tests.
 pub(crate) fn git_changed_files(project_root: &Path) -> Result<Vec<String>> {
     let mut files = Vec::new();
     for args in [
-        vec!["diff", "--no-color", "--no-ext-diff", "--name-only", "-z"],
         vec![
             "diff",
+            "--no-relative",
+            "--no-color",
+            "--no-ext-diff",
+            "--name-only",
+            "-z",
+        ],
+        vec![
+            "diff",
+            "--no-relative",
             "--no-color",
             "--no-ext-diff",
             "--name-only",
@@ -481,6 +492,8 @@ pub(crate) fn git_changed_files(project_root: &Path) -> Result<Vec<String>> {
             "-z",
             "--others",
             "--exclude-standard",
+            "--",
+            ":/",
         ],
     ] {
         for path in run_git(project_root, &args)? {
@@ -609,6 +622,7 @@ pub(crate) fn git_changed_line_ranges(
             "-c",
             "core.quotePath=false",
             "diff",
+            "--no-relative",
             "-U0",
             "--no-color",
             "--no-ext-diff",
@@ -647,6 +661,7 @@ pub(crate) fn git_added_files_since(project_root: &Path, collect_sha: &str) -> R
         project_root,
         &[
             "diff",
+            "--no-relative",
             "--name-only",
             "--no-color",
             "--no-renames",
@@ -1372,7 +1387,7 @@ mod tests {
         });
 
         let project = ProjectRoot {
-            git_root: root.clone(),
+            git_root: Some(root.clone()),
             git_prefix: PathBuf::new(),
             workspace_root: root.clone(),
             manifest_paths: vec![],
@@ -1481,7 +1496,7 @@ mod tests {
         });
 
         let project = ProjectRoot {
-            git_root: root.clone(),
+            git_root: Some(root.clone()),
             git_prefix: PathBuf::new(),
             workspace_root: root.clone(),
             manifest_paths: vec![],
@@ -1572,7 +1587,7 @@ mod tests {
         });
 
         let project = ProjectRoot {
-            git_root: root.clone(),
+            git_root: Some(root.clone()),
             git_prefix: PathBuf::new(),
             workspace_root: root.clone(),
             manifest_paths: vec![],

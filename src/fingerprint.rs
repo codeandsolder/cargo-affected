@@ -87,7 +87,11 @@ fn collect_inputs(project: &ProjectRoot, mode: ProfileMode) -> Result<Vec<(Strin
     // cannot be interpreted using Git-root paths. Also differentiate a
     // workspace moved under a different subdirectory of the same Git repo.
     let relative_workspace = &project.git_prefix;
-    let mut path_basis = b"git-root-v2/".to_vec();
+    let mut path_basis = if project.git_root.is_some() {
+        b"git-root-v3/".to_vec()
+    } else {
+        b"no-git".to_vec()
+    };
     path_basis.extend(relative_workspace.to_string_lossy().as_bytes());
     inputs.push(("coverage_path_basis".to_string(), path_basis));
     // Older baselines omit separately built executable coverage. They
@@ -241,7 +245,7 @@ mod tests {
 
     fn project_with(workspace_root: PathBuf, manifests: Vec<PathBuf>) -> ProjectRoot {
         ProjectRoot {
-            git_root: workspace_root.clone(),
+            git_root: Some(workspace_root.clone()),
             git_prefix: PathBuf::new(),
             workspace_root,
             manifest_paths: manifests,

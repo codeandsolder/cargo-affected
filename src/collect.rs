@@ -114,7 +114,12 @@ pub(crate) fn collect(options: CollectOptions<'_>, nextest_args: &[String]) -> R
     }
     // Git reports paths relative to the repository root. LLVM function
     // locations and crate-root sentinels must use that exact same basis.
-    let canonical_root = canonicalize_no_verbatim(&project.git_root)?;
+    let canonical_root = canonicalize_no_verbatim(
+        project
+            .git_root
+            .as_deref()
+            .context("coverage collection requires a Git repository")?,
+    )?;
     let canonical_workspace_root = canonicalize_no_verbatim(project_root)?;
 
     // Refuse to collect on a dirty tree by default: ranges would be filed
@@ -1059,7 +1064,7 @@ fn plan_diff_collect(
     if reach.reachable.is_empty() {
         bail!(
             "no reachable collect_sha for the current environment (every \
-             stored sha is rebased away or otherwise unreachable from HEAD); \
+             stored sha is missing from the repository); \
              run `cargo affected collect` to re-anchor"
         );
     }

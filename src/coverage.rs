@@ -303,7 +303,18 @@ impl<'a> ExecutableIndex<'a> {
 /// Windows. Returns `None` if the path isn't valid UTF-8 (paths originating
 /// from cargo/llvm-cov already are, but the call shape is still fallible).
 pub(crate) fn to_db_relative(path: &Path) -> Option<Utf8PathBuf> {
-    let utf8 = Utf8PathBuf::try_from(path.to_path_buf()).ok()?;
+    // LLVM can retain lexical `..` in #[path] modules and path dependencies.
+    // Reduce them inside the Git root; reject a path that escapes it.
+    let mut normalized = std::path::PathBuf::new();
+    for component in path.components() {
+        match component {
+            std::path::Component::Normal(part) => normalized.push(part),
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir if normalized.pop() => {}
+            _ => return None,
+        }
+    }
+    let utf8 = Utf8PathBuf::try_from(normalized).ok()?;
     if cfg!(windows) && utf8.as_str().contains('\\') {
         Some(Utf8PathBuf::from(utf8.as_str().replace('\\', "/")))
     } else {
@@ -843,6 +854,28 @@ _RNvC5probe12never_called
 #[cfg(test)]
 mod git_root_path_tests {
     use super::*;
+
+    #[test]
+    fn normalizes_parent_components_without_leaving_git_root() {
+        let root = Path::new("/repo");
+        let workspace = root.join("member");
+        assert_eq!(
+            to_git_relative(
+                &workspace.join("../shared/logic.rs"),
+                &workspace,
+                root,
+                Path::new("member")
+            ),
+            Some(Utf8PathBuf::from("shared/logic.rs"))
+        );
+        assert!(to_git_relative(
+            &workspace.join("../../outside.rs"),
+            &workspace,
+            root,
+            Path::new("member")
+        )
+        .is_none());
+    }
 
     #[test]
     fn workspace_paths_use_gits_spelling_instead_of_windows_short_name() {

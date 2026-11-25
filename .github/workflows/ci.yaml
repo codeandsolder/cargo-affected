@@ -17,6 +17,10 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
+# CI only needs to read the repository and toolchain manifests.
+permissions:
+  contents: read
+
 env:
   CARGO_TERM_COLOR: always
   # CI does clean builds, so incremental compilation tracking adds I/O overhead
