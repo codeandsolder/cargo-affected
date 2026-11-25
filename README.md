@@ -148,9 +148,15 @@ Cargo executables (including `test = false` binaries). Tests and their
 instrumented descendants write LLVM profiles into the same test-specific
 directory. Function hits from those executables are attributed to the test
 that launched them, including grandchildren; crate-root dependencies are
-included for matching executable maps. Identical function names in multiple
-maps are conservatively unioned rather than assigned arbitrarily. Baselines
-created before executable support require a fresh collect.
+included when an executable launch is evidenced or the profile is ambiguous.
+Identical function names in multiple maps are conservatively unioned rather
+than assigned arbitrarily. A direct library call in a single harness profile
+does not acquire the executable's structural sentinel just because the
+executable links the same library. Multiple raw profiles can include a
+child killed before its own entry point; ambiguous matches retain sentinels.
+The executable index is built once per collection, not parsed in each
+runner shim. Existing baselines require a fresh collect when the mapping
+version changes.
 
 The executable must be built with coverage instrumentation and be identified
 in Nextest's build metadata. Descendants must inherit the per-test
