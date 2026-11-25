@@ -141,7 +141,7 @@ pub(crate) fn config_rule_hits(
     project: &ProjectRoot,
     build_args: &[String],
     changed_paths: &BTreeSet<String>,
-    rustflags: Option<&str>,
+    rustflags: Option<&crate::profile::InstrumentFlags>,
     build_dir: Option<&Path>,
 ) -> Result<BTreeMap<String, BTreeSet<TestId>>> {
     let rules =
@@ -214,7 +214,7 @@ pub(crate) fn resolve_config_hits(
     build_args: &[String],
     rules: &[CompiledRule],
     changed_paths: &BTreeSet<String>,
-    rustflags: Option<&str>,
+    rustflags: Option<&crate::profile::InstrumentFlags>,
     build_dir: Option<&Path>,
 ) -> Result<BTreeMap<String, BTreeSet<TestId>>> {
     let mut out: BTreeMap<String, BTreeSet<TestId>> = BTreeMap::new();

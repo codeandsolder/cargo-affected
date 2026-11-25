@@ -6,7 +6,7 @@ use crate::{
     init_git_with_initial_commit, replace_in_file, write_two_module_project,
 };
 
-fn llvm_tool(name: &str) -> PathBuf {
+pub(crate) fn llvm_tool(name: &str) -> PathBuf {
     let sysroot = Command::new("rustc")
         .args(["--print", "sysroot"])
         .output()

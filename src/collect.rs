@@ -64,6 +64,7 @@ use crate::coverage::{self, HitRange};
 use crate::db::{Db, StateDir, TestId, FINGERPRINT_KEEP};
 use crate::fingerprint::{self, Fingerprint};
 use crate::plan::{self, CacheMiss, CacheState, PlanInputs, SelectionReport};
+use crate::profile::{InstrumentFlags, ProfileMode};
 use crate::project::{
     canonicalize_no_verbatim, find_project_root, git_changed_files, git_head_sha, git_prefix,
     git_working_tree_dirty, ProjectRoot,
@@ -85,6 +86,7 @@ pub(crate) struct CollectOptions<'a> {
     pub(crate) verbose: bool,
     pub(crate) allow_dirty: bool,
     pub(crate) state_dir: Option<&'a Path>,
+    pub(crate) mode: ProfileMode,
     pub(crate) aggregate_profile: Option<&'a Path>,
     pub(crate) build_info_json: Option<&'a Path>,
     pub(crate) report_json: Option<&'a Path>,
@@ -97,6 +99,7 @@ pub(crate) fn collect(options: CollectOptions<'_>, nextest_args: &[String]) -> R
         verbose,
         allow_dirty,
         state_dir,
+        mode,
         aggregate_profile,
         build_info_json,
         report_json,
@@ -144,7 +147,7 @@ pub(crate) fn collect(options: CollectOptions<'_>, nextest_args: &[String]) -> R
     require_nextest(project_root)?;
     let self_path = std::env::current_exe().context("failed to resolve current executable")?;
     let target_triple = current_target();
-    let runner_config = format_runner_config(&target_triple, &self_path);
+    let runner_config = format_runner_config(&target_triple, &self_path, mode);
 
     let llvm_profdata = find_llvm_tool("llvm-profdata")?;
     let llvm_cov = find_llvm_tool("llvm-cov")?;
@@ -238,11 +241,14 @@ pub(crate) fn collect(options: CollectOptions<'_>, nextest_args: &[String]) -> R
         })
         .collect();
 
-    let mut rustflags = std::env::var("RUSTFLAGS").unwrap_or_default();
-    if !rustflags.is_empty() {
-        rustflags.push(' ');
-    }
-    rustflags.push_str("-C instrument-coverage");
+    let rustflags = InstrumentFlags::new(mode);
+    mode.verify(
+        project_root,
+        state.path(),
+        &target_triple,
+        &rustflags,
+        &llvm_profdata,
+    )?;
 
     // List first. Gives us the stable (package, target, kind) → binary_id map
     // we'll use to disambiguate same-basename binaries (e.g. two crates with
@@ -259,6 +265,22 @@ pub(crate) fn collect(options: CollectOptions<'_>, nextest_args: &[String]) -> R
         &build_args,
         None,
     )?;
+    if mode == ProfileMode::Continuous {
+        let platforms = listing
+            .build_meta
+            .get("platforms")
+            .and_then(|value| value.get("targets"))
+            .and_then(|value| value.as_array())
+            .context("continuous mode requires Nextest target platform metadata")?;
+        for platform in platforms {
+            let triple = platform["platform"]["triple"]
+                .as_str()
+                .context("continuous mode requires a known native target triple")?;
+            if triple != target_triple {
+                bail!("continuous mode requires native Linux target {target_triple}, not {triple}");
+            }
+        }
+    }
     eprintln!(
         "found {} test{} across {}",
         listing.tests.len(),
@@ -273,7 +295,7 @@ pub(crate) fn collect(options: CollectOptions<'_>, nextest_args: &[String]) -> R
         std::fs::write(path, serde_json::to_vec_pretty(&info)?)
             .with_context(|| format!("writing build information to {}", path.display()))?;
     }
-    let fingerprint = fingerprint::compute(&project)?;
+    let fingerprint = fingerprint::compute(&project, mode)?;
     let env_fingerprint = &fingerprint.hex;
 
     // Open the DB once and thread it through. Eager open lets a busy/locked
@@ -379,7 +401,6 @@ pub(crate) fn collect(options: CollectOptions<'_>, nextest_args: &[String]) -> R
         // failure in `handle_no_results` using the diff plan's live-vs-phantom
         // split, not nextest's exit code.
         .arg("--no-tests=warn")
-        .env("RUSTFLAGS", &rustflags)
         // The runner shim extracts each test's coverage in-process and writes
         // a result file; it needs the staging locations, llvm-profdata, and
         // the function maps exported above. Names are shared constants so the
@@ -391,6 +412,7 @@ pub(crate) fn collect(options: CollectOptions<'_>, nextest_args: &[String]) -> R
         // Catches build-script profraw before the runner shim kicks in for tests.
         .env("LLVM_PROFILE_FILE", build_dir.join("build-%p-%m.profraw"))
         .current_dir(project_root);
+    rustflags.apply(&mut cmd);
     let filter_config = match &diff_plan {
         Some(plan) => {
             let config = write_nextest_config(project_root, &state, &plan.filter_expr())?;
@@ -586,7 +608,7 @@ struct ShadowReport<'a> {
     fingerprint: &'a Fingerprint,
     listing: &'a Listing,
     build_args: &'a [String],
-    rustflags: &'a str,
+    rustflags: &'a InstrumentFlags,
     build_dir: &'a Path,
     detail: selection::DiagnosticDetail,
 }
@@ -1544,7 +1566,7 @@ pub(crate) struct BinaryEntry {
 /// in `list_args` by [`splice_filter_expr`]. Leave `None` for a full listing.
 pub(crate) fn nextest_list(
     project_root: &Path,
-    rustflags_override: Option<&str>,
+    rustflags_override: Option<&InstrumentFlags>,
     build_dir: Option<&Path>,
     list_args: &[String],
     filter_expr: Option<&str>,
@@ -1558,7 +1580,7 @@ pub(crate) fn nextest_list(
         .stderr(Stdio::inherit())
         .current_dir(project_root);
     if let Some(rf) = rustflags_override {
-        cmd.env("RUSTFLAGS", rf);
+        rf.apply(&mut cmd);
     }
     if let Some(dir) = build_dir {
         cmd.arg("--target-dir").arg(dir);
@@ -1762,12 +1784,15 @@ fn find_llvm_tool(name: &str) -> Result<PathBuf> {
 /// (`~/Library/Application Support/…`). Inside the array each element is a
 /// TOML basic string, so `\` and `"` need escaping; nothing else realistic
 /// in a filesystem path does.
-fn format_runner_config(target_triple: &str, self_path: &Path) -> String {
+fn format_runner_config(target_triple: &str, self_path: &Path, mode: ProfileMode) -> String {
     let escaped = self_path
         .to_string_lossy()
         .replace('\\', r"\\")
         .replace('"', "\\\"");
-    format!(r#"target.{target_triple}.runner=["{escaped}", "runner-shim"]"#)
+    format!(
+        r#"target.{target_triple}.runner=["{escaped}", "{}"]"#,
+        mode.runner()
+    )
 }
 
 /// Get the current rustc target triple.
@@ -2242,7 +2267,7 @@ mod tests {
     fn runner_config_uses_toml_array_form() {
         let path = PathBuf::from("/usr/local/bin/cargo-affected");
         assert_eq!(
-            format_runner_config("aarch64-apple-darwin", &path),
+            format_runner_config("aarch64-apple-darwin", &path, ProfileMode::Exit),
             r#"target.aarch64-apple-darwin.runner=["/usr/local/bin/cargo-affected", "runner-shim"]"#,
         );
     }
@@ -2254,7 +2279,7 @@ mod tests {
     fn runner_config_preserves_spaces_in_path() {
         let path = PathBuf::from("/Users/Joe Smith/.cargo/bin/cargo-affected");
         assert_eq!(
-            format_runner_config("aarch64-apple-darwin", &path),
+            format_runner_config("aarch64-apple-darwin", &path, ProfileMode::Exit),
             r#"target.aarch64-apple-darwin.runner=["/Users/Joe Smith/.cargo/bin/cargo-affected", "runner-shim"]"#,
         );
     }
@@ -2265,7 +2290,7 @@ mod tests {
     fn runner_config_escapes_backslashes_and_quotes() {
         let path = PathBuf::from(r#"C:\Users\Joe "Q" Smith\cargo-affected.exe"#);
         assert_eq!(
-            format_runner_config("x86_64-pc-windows-msvc", &path),
+            format_runner_config("x86_64-pc-windows-msvc", &path, ProfileMode::Exit),
             r#"target.x86_64-pc-windows-msvc.runner=["C:\\Users\\Joe \"Q\" Smith\\cargo-affected.exe", "runner-shim"]"#,
         );
     }

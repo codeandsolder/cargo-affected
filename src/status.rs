@@ -36,6 +36,7 @@ use crate::selection::{self, DiagnosticDetail};
 pub(crate) fn status(
     verbose: bool,
     state_dir: Option<&Path>,
+    mode: crate::profile::ProfileMode,
     report_json: Option<&Path>,
     detail: DiagnosticDetail,
     nextest_args: &[String],
@@ -53,7 +54,7 @@ pub(crate) fn status(
         if let Some(report_path) = report_json {
             // No DB at all → still emit a partial report naming
             // MissNoCoverage so consumers get a parseable artifact.
-            let fingerprint = fingerprint::compute(&project)?;
+            let fingerprint = fingerprint::compute(&project, mode)?;
             plan::write_full_suite_report(
                 "status",
                 CacheStatus::MissNoCoverage,
@@ -70,7 +71,7 @@ pub(crate) fn status(
         return Ok(());
     }
 
-    let fingerprint = fingerprint::compute(&project)?;
+    let fingerprint = fingerprint::compute(&project, mode)?;
     let db = Db::open(&state_dir)?;
     let Assessment {
         test_count,

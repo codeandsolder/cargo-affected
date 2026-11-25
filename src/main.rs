@@ -10,6 +10,7 @@ mod coverage;
 mod db;
 mod fingerprint;
 mod plan;
+mod profile;
 mod project;
 mod report;
 mod run;
@@ -41,6 +42,10 @@ struct Cli {
     /// Choose a Git-ignored directory or a path outside the checkout.
     #[arg(long, global = true, value_name = "PATH")]
     state_dir: Option<PathBuf>,
+    /// Persist LLVM counters continuously, including killed subprocesses.
+    /// Native Linux only; use the same mode for collect, run and status.
+    #[arg(long, global = true)]
+    continuous: bool,
     #[command(subcommand)]
     action: Action,
 }
@@ -165,8 +170,10 @@ fn main() {
     // `runner-shim` is the hidden per-test coverage runner invoked by cargo/nextest
     // via `--config target.<triple>.runner=…`. Dispatch before clap — its trailing
     // args include `--exact`/`--list`/etc. which clap would interpret if we let it.
-    if argv.get(1).map(String::as_str) == Some("runner-shim") {
-        shim::run(&argv[2..]);
+    match argv.get(1).map(String::as_str) {
+        Some("runner-shim") => shim::run(&argv[2..], profile::ProfileMode::Exit),
+        Some("runner-shim-continuous") => shim::run(&argv[2..], profile::ProfileMode::Continuous),
+        _ => {}
     }
 
     // Stop NEXTEST_BINARY_ID / NEXTEST_TEST_NAME from leaking into our inner
@@ -190,7 +197,12 @@ fn main() {
 
     let cli = Cli::parse_from(argv);
 
-    let exit_code = match run_action(cli.action, cli.verbose, cli.state_dir.as_deref()) {
+    let exit_code = match run_action(
+        cli.action,
+        cli.verbose,
+        cli.state_dir.as_deref(),
+        profile::ProfileMode::from_flag(cli.continuous),
+    ) {
         Ok(code) => code,
         Err(e) => {
             eprintln!("Error: {e:#}");
@@ -200,7 +212,13 @@ fn main() {
     std::process::exit(exit_code);
 }
 
-fn run_action(action: Action, verbose: bool, state_dir: Option<&std::path::Path>) -> Result<i32> {
+fn run_action(
+    action: Action,
+    verbose: bool,
+    state_dir: Option<&std::path::Path>,
+    mode: profile::ProfileMode,
+) -> Result<i32> {
+    mode.check_platform()?;
     match action {
         Action::Collect {
             diff,
@@ -216,6 +234,7 @@ fn run_action(action: Action, verbose: bool, state_dir: Option<&std::path::Path>
                 verbose,
                 allow_dirty,
                 state_dir,
+                mode,
                 aggregate_profile: aggregate_profile.as_deref(),
                 build_info_json: build_info_json.as_deref(),
                 report_json: report_json.as_deref(),
@@ -232,6 +251,7 @@ fn run_action(action: Action, verbose: bool, state_dir: Option<&std::path::Path>
             all,
             verbose,
             state_dir,
+            mode,
             report_json.as_deref(),
             report_detail,
             &nextest_args,
@@ -244,6 +264,7 @@ fn run_action(action: Action, verbose: bool, state_dir: Option<&std::path::Path>
             status::status(
                 verbose,
                 state_dir,
+                mode,
                 report_json.as_deref(),
                 report_detail,
                 &nextest_args,

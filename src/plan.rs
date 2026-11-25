@@ -238,7 +238,7 @@ pub(crate) fn plan(inputs: PlanInputs<'_>) -> Result<Plan> {
 pub(crate) fn plan_with_listing(
     inputs: PlanInputs<'_>,
     listing: &Listing,
-    rustflags: Option<&str>,
+    rustflags: Option<&crate::profile::InstrumentFlags>,
     build_dir: Option<&Path>,
 ) -> Result<Plan> {
     let PlanInputs {
