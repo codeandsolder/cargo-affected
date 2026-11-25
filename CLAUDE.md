@@ -18,10 +18,11 @@ git config, assertion style, the two under-selection tripwires): `tests/CLAUDE.m
 check, and the whitespace/YAML fixers.
 
 `benches/collect.rs` generates a deliberately *wide* crate (20,000 functions,
-120 tests) under `target/affected-bench/` and times `collect` over it, because
-collect's per-test cost scales with the binary's coverage-map size rather than
-with the test. A benchmark on a small crate measures nothing. It reports the
-fastest of several serial runs; see the file's module docs for why.
+120 tests) under `target/affected-bench/` and times `collect` over it, with
+the same wide library linked into a separate executable and integration test
+binary. This catches regressions where marginal per-test cost again scales
+with the whole binary map. A benchmark on a small crate measures nothing. It reports the
+fastest of several serial runs; pass `--collector PATH` to compare another build. See the file's module docs for why.
 
 ## Releasing
 
