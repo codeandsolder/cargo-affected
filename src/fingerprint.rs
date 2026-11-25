@@ -39,7 +39,7 @@ pub(crate) struct Fingerprint {
 /// A single named input contributing to the composite fingerprint.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct FingerprintComponent {
-    /// Stable label (`coverage_path_basis`, `cargo_lock`,
+    /// Stable label (`coverage_path_basis, coverage_mapping`, `cargo_lock`,
     /// `manifest:Cargo.toml`, `rustc`, `RUSTFLAGS`, `CARGO_BUILD_TARGET`).
     pub(crate) label: String,
     /// SHA-256 hex digest of this component's bytes alone.
@@ -90,6 +90,12 @@ fn collect_inputs(project: &ProjectRoot) -> Result<Vec<(String, Vec<u8>)>> {
     let mut path_basis = b"git-root-v2/".to_vec();
     path_basis.extend(relative_workspace.to_string_lossy().as_bytes());
     inputs.push(("coverage_path_basis".to_string(), path_basis));
+    // Older baselines omit separately built executable coverage. They
+    // cannot be used to safely select tests after upgrading this collector.
+    inputs.push((
+        "coverage_mapping".to_string(),
+        b"executable-maps-v1".to_vec(),
+    ));
 
     inputs.push((
         "cargo_lock".to_string(),
@@ -389,6 +395,7 @@ mod tests {
             labels,
             vec![
                 "coverage_path_basis",
+                "coverage_mapping",
                 "cargo_lock",
                 "manifest:Cargo.toml",
                 "manifest:crates/foo/Cargo.toml",
