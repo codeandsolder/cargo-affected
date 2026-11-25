@@ -4,10 +4,11 @@
 //! small runner shim (`cargo-affected runner-shim`) via
 //! `--config target.<triple>.runner=[…]` that points `LLVM_PROFILE_FILE` at a
 //! per-test subdirectory, then spawns and waits for the real test binary and
-//! merges its profraws, writes the executed names, and deletes the raw files
-//! before exiting. Each binary's function map — the expensive,
+//! turns its profile into line ranges on the spot — merging profraws, joining
+//! them against the binary's function map, and writing a small per-test result
+//! file — before exiting. Each binary's function map — the expensive,
 //! test-invariant half of that translation — is exported once, before the run.
-//! After nextest finishes we stream the results, join the in-memory maps, and write
+//! After nextest finishes we read those per-test result files back and write
 //! per-(test, file) line ranges to SQLite. See the Approach section below and
 //! [`crate::shim`] for the in-shim extraction details.
 //!
@@ -32,8 +33,8 @@
 //!    in RUSTFLAGS, to enumerate every binary and every testcase. This builds
 //!    the instrumented binaries, so the `run` below is a cache hit.
 //! 4. Export each participating binary's coverage map **once**, with
-//!    `llvm-cov export` against an empty profile. Keep it in memory and write
-//!    only a stamp under `CARGO_AFFECTED_FUNCTION_MAPS_DIR`. This is the expensive half of extraction
+//!    `llvm-cov export` against an empty profile, and leave it under
+//!    `CARGO_AFFECTED_FUNCTION_MAPS_DIR`. This is the expensive half of extraction
 //!    and it doesn't vary per test — see [`write_function_maps`].
 //! 5. `cargo nextest run` with the same RUSTFLAGS and the runner wired in via
 //!    `--config`. nextest handles parallelism and progress. Each test
@@ -41,15 +42,15 @@
 //!    runner shim doesn't need to map paths.
 //! 6. **Inside the runner shim**: each test's shim (`cargo-affected
 //!    runner-shim`) spawns the test binary, waits for it, then merges its
-//!    profraw to text with `llvm-profdata`, writes the executed names to a file under
+//!    profraw to text with `llvm-profdata`, joins the functions it names
+//!    against the binary's map, writes a small per-test result file under
 //!    `CARGO_AFFECTED_RESULTS_DIR`, and **deletes the per-test profraw dir
 //!    before exiting**. Extraction runs in the process that ran the test, so
 //!    peak disk usage is bounded by nextest's own concurrency
 //!    (O(test-threads × per-test bundle) instead of O(whole-suite)) with no
 //!    external watcher or completion heuristic — the completion signal is the
 //!    test process exiting. See [`crate::shim`].
-//! 7. After nextest exits, stream the per-test results, join the retained maps
-//!    and the once-built executable index, and store mappings
+//! 7. After nextest exits, read the per-test result files and store mappings
 //!    + collect_sha in the DB keyed by (binary_id, test_name).
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -60,13 +61,15 @@ use std::time::Instant;
 use anyhow::{bail, Context, Result};
 
 use crate::coverage::{self, HitRange};
-use crate::db::{affected_dir, Db, TestId, FINGERPRINT_KEEP};
-use crate::fingerprint;
+use crate::db::{Db, StateDir, TestId, FINGERPRINT_KEEP};
+use crate::fingerprint::{self, Fingerprint};
+use crate::plan::{self, CacheMiss, CacheState, PlanInputs, SelectionReport};
 use crate::profile::{InstrumentFlags, ProfileMode};
-use crate::project::ProjectRoot;
 use crate::project::{
-    canonicalize_no_verbatim, find_project_root, git_head_sha, git_working_tree_dirty,
+    canonicalize_no_verbatim, find_project_root, git_changed_files, git_head_sha,
+    git_working_tree_dirty, ProjectRoot,
 };
+use crate::report;
 use crate::selection;
 use crate::shim::{self, TestOutcome, TestResult};
 
@@ -78,16 +81,34 @@ use crate::shim::{self, TestOutcome, TestResult};
 /// new HEAD. Other tests' rows stay put. Errors out if there's no prior
 /// collect for the current environment, or if any stored sha is no longer
 /// reachable from HEAD.
-pub(crate) fn collect(
-    diff: bool,
-    verbose: bool,
-    allow_dirty: bool,
-    mode: ProfileMode,
-    nextest_args: &[String],
-) -> Result<i32> {
+pub(crate) struct CollectOptions<'a> {
+    pub(crate) diff: bool,
+    pub(crate) verbose: bool,
+    pub(crate) allow_dirty: bool,
+    pub(crate) state_dir: Option<&'a Path>,
+    pub(crate) mode: ProfileMode,
+    pub(crate) aggregate_profile: Option<&'a Path>,
+    pub(crate) build_info_json: Option<&'a Path>,
+    pub(crate) report_json: Option<&'a Path>,
+    pub(crate) report_detail: selection::DiagnosticDetail,
+}
+
+pub(crate) fn collect(options: CollectOptions<'_>, nextest_args: &[String]) -> Result<i32> {
+    let CollectOptions {
+        diff,
+        verbose,
+        allow_dirty,
+        state_dir,
+        mode,
+        aggregate_profile,
+        build_info_json,
+        report_json,
+        report_detail,
+    } = options;
     let total_start = Instant::now();
     let project = find_project_root()?;
     let project_root = &project.workspace_root;
+    let state = StateDir::new(project_root, state_dir);
     if verbose {
         eprintln!("project root: {}", project_root.display());
     }
@@ -113,6 +134,17 @@ pub(crate) fn collect(
             );
         }
     }
+
+    // Invalidate any cached output before starting the run. Keep a failure
+    // here separate from per-test collection, just like a publication error.
+    let aggregate_reset =
+        aggregate_profile.map_or(Ok(()), |output| match std::fs::remove_file(output) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => {
+                Err(error).with_context(|| format!("removing stale profile {}", output.display()))
+            }
+        });
 
     require_nextest(project_root)?;
     let self_path = std::env::current_exe().context("failed to resolve current executable")?;
@@ -148,7 +180,7 @@ pub(crate) fn collect(
     // The matching `cargo affected run` flow leaves --target-dir unset so
     // it reuses target/debug/ — the user's normal cache — since `run`
     // doesn't enable instrumentation.
-    let build_dir = affected_dir(project_root).join("build");
+    let build_dir = state.path().join("build");
     std::fs::create_dir_all(&build_dir).context("failed to create build dir")?;
     // Sweep stale build-script profraws from prior collects; they accumulate
     // every time a build.rs reruns under instrumentation and aren't useful
@@ -166,10 +198,11 @@ pub(crate) fn collect(
     // each PID-suffixed so concurrent `collect` invocations don't wipe each
     // other's staging.
     let pid = std::process::id();
-    let profraw_dir = affected_dir(project_root).join(format!("{PROFRAW_DIR_PREFIX}{pid}"));
-    let results_dir = affected_dir(project_root).join(format!("{RESULTS_DIR_PREFIX}{pid}"));
-    let function_maps_dir =
-        affected_dir(project_root).join(format!("{FUNCTION_MAPS_DIR_PREFIX}{pid}"));
+    let profraw_dir = state.path().join(format!("{PROFRAW_DIR_PREFIX}{pid}"));
+    let results_dir = state.path().join(format!("{RESULTS_DIR_PREFIX}{pid}"));
+    let function_maps_dir = state
+        .path()
+        .join(format!("{FUNCTION_MAPS_DIR_PREFIX}{pid}"));
     for dir in [&profraw_dir, &results_dir, &function_maps_dir] {
         if dir.exists() {
             std::fs::remove_dir_all(dir)
@@ -177,6 +210,11 @@ pub(crate) fn collect(
         }
         std::fs::create_dir_all(dir)
             .with_context(|| format!("failed to create {}", dir.display()))?;
+    }
+
+    let aggregate_dir = crate::aggregate::directory(&results_dir);
+    if aggregate_profile.is_some() {
+        std::fs::create_dir(&aggregate_dir)?;
     }
 
     // Per-target sentinel set keyed by nextest's `binary_id`. Each test's
@@ -208,7 +246,7 @@ pub(crate) fn collect(
     let rustflags = InstrumentFlags::new(mode);
     mode.verify(
         project_root,
-        &affected_dir(project_root),
+        state.path(),
         &target_triple,
         &rustflags,
         &llvm_profdata,
@@ -221,11 +259,12 @@ pub(crate) fn collect(
     // cache hit. Fingerprint is taken now so Cargo.lock is in its final
     // state — status/run will compare against that same state.
     eprintln!("listing tests with cargo nextest list...");
+    let build_args = args_for_listing(nextest_args);
     let listing = nextest_list(
         project_root,
         Some(&rustflags),
         Some(&build_dir),
-        &args_for_listing(nextest_args),
+        &build_args,
         None,
     )?;
     if mode == ProfileMode::Continuous {
@@ -250,12 +289,38 @@ pub(crate) fn collect(
         plural_s(listing.tests.len()),
         binaries_phrase(listing.binaries.len())
     );
+    if let Some(path) = build_info_json {
+        let info = serde_json::json!({
+            "workspace-root": project_root,
+            "rust-build-meta": listing.build_meta,
+        });
+        std::fs::write(path, serde_json::to_vec_pretty(&info)?)
+            .with_context(|| format!("writing build information to {}", path.display()))?;
+    }
     let fingerprint = fingerprint::compute(&project, mode)?;
     let env_fingerprint = &fingerprint.hex;
 
     // Open the DB once and thread it through. Eager open lets a busy/locked
     // database error out before we spend time on extraction.
-    let mut db = Db::open(project_root)?;
+    let mut db = Db::open(&state)?;
+
+    if let Some(path) = report_json {
+        let request = ShadowReport {
+            project: &project,
+            db: &db,
+            fingerprint: &fingerprint,
+            listing: &listing,
+            build_args: &build_args,
+            rustflags: &rustflags,
+            build_dir: &build_dir,
+            detail: report_detail,
+        };
+        if let Err(error) = request.write(path) {
+            // Shadow diagnostics are advisory. Even an invalid configuration
+            // rule or unavailable report path must not suppress full testing.
+            eprintln!("warning: pre-collection selection unavailable: {error:#}");
+        }
+    }
 
     // Diff mode: validate prior collect, run selection, build the
     // nextest filter expression for the rerun set. Done after the listing
@@ -353,7 +418,7 @@ pub(crate) fn collect(
     rustflags.apply(&mut cmd);
     let filter_config = match &diff_plan {
         Some(plan) => {
-            let config = write_nextest_config(project_root, &plan.filter_expr())?;
+            let config = write_nextest_config(project_root, &state, &plan.filter_expr())?;
             cmd.arg("--config-file").arg(&config);
             Some(config)
         }
@@ -378,8 +443,12 @@ pub(crate) fn collect(
     let mut mappings: Vec<(TestId, BTreeSet<HitRange>)> = Vec::new();
     let mut unknown_binaries: BTreeSet<String> = BTreeSet::new();
     let mut skipped_tests = Vec::new();
+    let mut aggregate_errors = Vec::new();
     let count = read_results(&results_dir, |result| {
         let test_id = TestId::new(result.binary_id, result.test_name);
+        if let Some(error) = result.aggregate_error {
+            aggregate_errors.push((test_id.clone(), error));
+        }
         let ranges = match result.outcome {
             TestOutcome::Collected {
                 functions,
@@ -416,16 +485,30 @@ pub(crate) fn collect(
             diff_plan.as_ref(),
             nextest_exit,
             &results_dir,
-        )?;
+        );
         remove_staging_dirs(&[&profraw_dir, &results_dir, &function_maps_dir])?;
+        let exit = exit?;
+        if aggregate_profile.is_some() {
+            aggregate_reset.context("aggregate profile unavailable")?;
+            bail!("aggregate profile unavailable: no coverage results");
+        }
         return Ok(exit);
     }
+
     mappings.sort_by(|a, b| a.0.cmp(&b.0));
     skipped_tests.sort_by(|a, b| a.0.cmp(&b.0));
     let skipped = skipped_tests.len();
     for (id, reason) in skipped_tests {
         eprintln!("  skipped {}::{}: {reason}", id.binary_id, id.test_name);
     }
+    aggregate_errors.sort_by(|a, b| a.0.cmp(&b.0));
+    for (id, error) in &aggregate_errors {
+        eprintln!(
+            "  aggregate profile for {}::{}: {error}",
+            id.binary_id, id.test_name
+        );
+    }
+    let aggregate_error = aggregate_errors.into_iter().next().map(|(_, error)| error);
     if !unknown_binaries.is_empty() {
         bail!(
             "coverage results reference binary_ids absent from the workspace \
@@ -453,7 +536,6 @@ pub(crate) fn collect(
         );
     }
 
-    let total_elapsed = total_start.elapsed();
     let region_count: usize = mappings.iter().map(|(_, r)| r.len()).sum();
 
     if let Some(plan) = diff_plan {
@@ -492,16 +574,119 @@ pub(crate) fn collect(
         eprintln!("evicted {evicted} stale fingerprint{s} (kept {kept} of {FINGERPRINT_KEEP})");
     }
 
+    let aggregate_result = aggregate_profile.map_or(Ok(()), |output| {
+        aggregate_reset?;
+        if nextest_exit != 0 {
+            bail!("nextest exited with code {nextest_exit}; no profile published");
+        }
+        if skipped != 0 {
+            bail!("{skipped} tests had incomplete coverage");
+        }
+        if let Some(error) = aggregate_error {
+            bail!("{error}");
+        }
+        // Include setup and discovery profiles outside the test shim.
+        for entry in std::fs::read_dir(&build_dir)? {
+            let path = entry?.path();
+            if path.extension().is_some_and(|ext| ext == "profraw") {
+                crate::aggregate::add(&aggregate_dir, &llvm_profdata, &path)?;
+            }
+        }
+        crate::aggregate::finish(&aggregate_dir, &llvm_profdata, output)
+    });
+
     eprintln!(
-        "done. {} test{}, {} range{} stored in target/affected/coverage.db ({:.1}s total)",
+        "done. {} test{}, {} range{} stored in {} ({:.1}s total)",
         mappings.len(),
         plural_s(mappings.len()),
         region_count,
         plural_s(region_count),
-        total_elapsed.as_secs_f64(),
+        state
+            .database()
+            .strip_prefix(project_root)
+            .unwrap_or(&state.database())
+            .display(),
+        total_start.elapsed().as_secs_f64(),
     );
     remove_staging_dirs(&[&profraw_dir, &results_dir, &function_maps_dir])?;
+    // Preserve nextest's failure code, but never report success if the
+    // requested aggregate could not be produced. The DB is already stored.
+    if nextest_exit != 0 {
+        if let Err(error) = aggregate_result {
+            eprintln!("aggregate profile unavailable: {error:#}");
+        }
+    } else {
+        aggregate_result.context("aggregate profile unavailable")?;
+    }
     Ok(nextest_exit)
+}
+
+/// Selection against the prior baseline, using precisely the test listing
+/// and build configuration of the full instrumented run that will follow.
+struct ShadowReport<'a> {
+    project: &'a ProjectRoot,
+    db: &'a Db,
+    fingerprint: &'a Fingerprint,
+    listing: &'a Listing,
+    build_args: &'a [String],
+    rustflags: &'a InstrumentFlags,
+    build_dir: &'a Path,
+    detail: selection::DiagnosticDetail,
+}
+
+impl ShadowReport<'_> {
+    fn write(&self, path: &Path) -> Result<()> {
+        let root = &self.project.workspace_root;
+        let assessment = plan::assess(root, self.db, self.fingerprint, true)?;
+        match assessment.state {
+            CacheState::Usable(reach) => {
+                let changed_files = git_changed_files(root)?;
+                crate::db::warn_untracked_rs_files(self.db, &self.fingerprint.hex, &changed_files)?;
+                let plan = plan::plan_with_listing(
+                    PlanInputs {
+                        project: self.project,
+                        db: self.db,
+                        fingerprint_hex: &self.fingerprint.hex,
+                        reach: &reach,
+                        changed_files: &changed_files,
+                        build_args: self.build_args,
+                        detail: self.detail,
+                    },
+                    self.listing,
+                    Some(self.rustflags),
+                    Some(self.build_dir),
+                )?;
+                plan::write_selection_report(
+                    SelectionReport {
+                        command: "collect",
+                        db: self.db,
+                        fingerprint: self.fingerprint,
+                        stored: assessment.stored,
+                        reach: &reach,
+                        plan: &plan,
+                    },
+                    path,
+                )
+            }
+            CacheState::Miss(miss) => {
+                let snapshots = match &miss {
+                    CacheMiss::NoReachableSha(reach) => {
+                        let row_counts = self.db.row_counts_by_sha(&self.fingerprint.hex)?;
+                        report::collect_sha_snapshots(reach, &row_counts)
+                    }
+                    _ => Vec::new(),
+                };
+                plan::write_full_suite_report(
+                    "collect",
+                    miss.status(),
+                    Some(self.fingerprint.clone()),
+                    assessment.stored,
+                    snapshots,
+                    path,
+                )
+            }
+        }
+    }
 }
 
 /// Per-collect staging-dir name prefixes under `target/affected/`, each
@@ -739,13 +924,13 @@ fn remove_staging_dirs(dirs: &[&Path]) -> Result<()> {
 /// Only invoked from `clean` (an explicit, destructive user command), never at
 /// collect startup: the PID suffix lets concurrent collects coexist, and a
 /// blind sweep would delete a sibling collect's live staging.
-pub(crate) fn clean_staging_dirs(project_root: &Path) -> Result<usize> {
-    let dir = affected_dir(project_root);
+pub(crate) fn clean_staging_dirs(state: &StateDir) -> Result<usize> {
+    let dir = state.path();
     if !dir.exists() {
         return Ok(0);
     }
     let mut removed = 0;
-    for entry in std::fs::read_dir(&dir).context("scanning target/affected")? {
+    for entry in std::fs::read_dir(dir).with_context(|| format!("scanning {}", dir.display()))? {
         let path = entry?.path();
         let is_staging = path.is_dir()
             && path
@@ -1039,7 +1224,11 @@ pub(crate) fn nextest_filter_expr(tests: &[TestId]) -> String {
 /// project already sets `default-filter`, the selection is intersected with
 /// it so the effective set matches the old inline-`-E` behavior (`-E` was
 /// likewise intersected with the default filter).
-pub(crate) fn write_nextest_config(project_root: &Path, filter_expr: &str) -> Result<PathBuf> {
+pub(crate) fn write_nextest_config(
+    project_root: &Path,
+    state: &StateDir,
+    filter_expr: &str,
+) -> Result<PathBuf> {
     let project_config = project_root.join(".config").join("nextest.toml");
     let existing = match std::fs::read_to_string(&project_config) {
         Ok(s) => s,
@@ -1063,8 +1252,8 @@ pub(crate) fn write_nextest_config(project_root: &Path, filter_expr: &str) -> Re
     };
     doc["profile"]["default"]["default-filter"] = toml_edit::value(filter);
 
-    let dir = affected_dir(project_root);
-    std::fs::create_dir_all(&dir).context("failed to create target/affected dir")?;
+    let dir = state.path();
+    std::fs::create_dir_all(dir).with_context(|| format!("failed to create {}", dir.display()))?;
     // PID-suffixed so two concurrent `cargo affected` runs can't overwrite
     // each other's selection between writing the file and nextest reading it
     // — the same reasoning as the `profraw-<pid>` staging dir. The caller
@@ -1287,7 +1476,7 @@ pub(crate) struct Listing {
     /// (`reason: "expression"`), and the project's own `default-filter`.
     pub(crate) excluded: BTreeSet<TestId>,
     pub(crate) binaries: Vec<BinaryEntry>,
-    build_meta: serde_json::Value,
+    pub(crate) build_meta: serde_json::Value,
 }
 
 impl Listing {
@@ -1486,8 +1675,8 @@ pub(crate) fn nextest_list(
         binaries,
         build_meta: json
             .get("rust-build-meta")
-            .cloned()
-            .context("nextest list missing rust-build-meta")?,
+            .context("nextest list missing rust-build-meta")?
+            .clone(),
     })
 }
 
@@ -1661,9 +1850,9 @@ mod tests {
 
     fn listing(binaries: &[(&str, &str)], tests: &[(&str, &str)]) -> Listing {
         Listing {
-            build_meta: serde_json::Value::Null,
             tests: tests.iter().map(|(b, t)| TestId::new(*b, *t)).collect(),
             excluded: BTreeSet::new(),
+            build_meta: serde_json::Value::Null,
             binaries: binaries
                 .iter()
                 .map(|(id, path)| BinaryEntry {
@@ -1979,7 +2168,8 @@ mod tests {
         // that lands on the command line is `--config-file <path>`, whose
         // length is bounded by the path, not the test count.
         let dir = tempfile::tempdir().unwrap();
-        let config = write_nextest_config(dir.path(), &expr).unwrap();
+        let config =
+            write_nextest_config(dir.path(), &StateDir::new(dir.path(), None), &expr).unwrap();
         assert!(config.starts_with(dir.path()));
         let written = std::fs::read_to_string(&config).unwrap();
         for n in &names {
@@ -2017,7 +2207,12 @@ mod tests {
              setup = \"build-bins\"\n",
         )
         .unwrap();
-        let config = write_nextest_config(dir.path(), "binary_id(=x) & test(=y)").unwrap();
+        let config = write_nextest_config(
+            dir.path(),
+            &StateDir::new(dir.path(), None),
+            "binary_id(=x) & test(=y)",
+        )
+        .unwrap();
         let doc: toml_edit::DocumentMut =
             std::fs::read_to_string(&config).unwrap().parse().unwrap();
         // Our selection landed under [profile.default].
@@ -2057,7 +2252,8 @@ mod tests {
             "[profile.default]\ndefault-filter = \"not test(slow)\"\n",
         )
         .unwrap();
-        let config = write_nextest_config(dir.path(), "test(=y)").unwrap();
+        let config =
+            write_nextest_config(dir.path(), &StateDir::new(dir.path(), None), "test(=y)").unwrap();
         let doc: toml_edit::DocumentMut =
             std::fs::read_to_string(&config).unwrap().parse().unwrap();
         assert_eq!(
@@ -2074,7 +2270,9 @@ mod tests {
     #[test]
     fn write_nextest_config_without_project_config() {
         let dir = tempfile::tempdir().unwrap();
-        let config = write_nextest_config(dir.path(), "test(=solo)").unwrap();
+        let config =
+            write_nextest_config(dir.path(), &StateDir::new(dir.path(), None), "test(=solo)")
+                .unwrap();
         assert!(config
             .file_name()
             .unwrap()
@@ -2151,6 +2349,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
 
         let good = TestResult {
+            aggregate_error: None,
             binary_id: "crate-a".into(),
             test_name: "t_ok".into(),
             outcome: TestOutcome::Skipped { reason: "x".into() },
@@ -2179,7 +2378,7 @@ mod tests {
         std::fs::create_dir_all(affected.join("build")).unwrap();
         std::fs::write(affected.join("coverage.db"), b"db").unwrap();
 
-        let removed = clean_staging_dirs(root).unwrap();
+        let removed = clean_staging_dirs(&StateDir::new(root, None)).unwrap();
         assert_eq!(removed, 3);
         assert!(!affected.join("profraw-123").exists());
         assert!(!affected.join("results-456").exists());

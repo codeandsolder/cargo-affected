@@ -17,8 +17,7 @@
 //! regains control the moment the test process exits — at which point the
 //! LLVM runtime has flushed the profile. So extraction happens right here, in
 //! the process that ran the test: merge the profraw into its text form with
-//! `llvm-profdata`, write the executed function names to a per-test
-//! [`TestResult`] JSON file under
+//! `llvm-profdata`, write the executed names to a per-test [`TestResult`] JSON file under
 //! `CARGO_AFFECTED_RESULTS_DIR`, and delete the per-test profraw dir before
 //! exiting. `collect` reads those result files once nextest finishes.
 //!
@@ -81,6 +80,7 @@ pub(crate) struct TestResult {
     pub(crate) binary_id: String,
     pub(crate) test_name: String,
     pub(crate) outcome: TestOutcome,
+    pub(crate) aggregate_error: Option<String>,
 }
 
 /// Outcome of extracting one test's coverage. `Skipped` covers every soft
@@ -143,7 +143,26 @@ pub(crate) fn run(args: &[String], mode: crate::profile::ProfileMode) -> ! {
     // result, and free the bundle — the delete is what keeps peak disk
     // bounded to nextest's concurrency.
     let outcome = extract(&dir, &binary_id, Path::new(binary), &env);
-    write_result(&env.results_dir, &binary_id, &test_name, outcome);
+    let mut result = TestResult {
+        binary_id,
+        test_name,
+        outcome,
+        aggregate_error: None,
+    };
+    // Record the per-test coverage before optional compaction. Even if a
+    // compactor is killed by a timeout, its valid per-test map survives.
+    write_result(&env.results_dir, &result);
+    let aggregate_dir = crate::aggregate::directory(&env.results_dir);
+    if aggregate_dir.is_dir() && matches!(result.outcome, TestOutcome::Collected { .. }) {
+        if let Err(error) = crate::aggregate::add(
+            &aggregate_dir,
+            &env.llvm_profdata,
+            &dir.join("coverage.proftext"),
+        ) {
+            result.aggregate_error = Some(format!("{error:#}"));
+            write_result(&env.results_dir, &result);
+        }
+    }
     let _ = std::fs::remove_dir_all(&dir);
 
     std::process::exit(code);
@@ -173,7 +192,7 @@ fn run_test(binary: &str, rest: &[String]) -> i32 {
     }
 }
 
-/// The llvm-profdata path, the binary stamps to validate, and where to
+/// The llvm-profdata path, the function maps to join against, and where to
 /// stage output — everything `collect` hands the shim via the environment (see
 /// the `ENV_*` constants). Present together or not at all: `collect` sets every
 /// one whenever it sets [`ENV_PROFRAW_BASE`].
@@ -332,18 +351,13 @@ pub(crate) fn stamp_path(function_maps_dir: &Path, binary_id: &str) -> PathBuf {
 ///
 /// Best-effort: a failure here costs this test one collect (it's re-selected
 /// next `--diff`), so we warn rather than abort the test.
-fn write_result(results_dir: &Path, binary_id: &str, test_name: &str, outcome: TestOutcome) {
-    let dir = results_dir.join(storage_key(binary_id));
-    let path = dir.join(format!("{}.json", storage_key(test_name)));
+fn write_result(results_dir: &Path, result: &TestResult) {
+    let dir = results_dir.join(storage_key(&result.binary_id));
+    let path = dir.join(format!("{}.json", storage_key(&result.test_name)));
     let tmp = path.with_extension("json.tmp");
-    let result = TestResult {
-        binary_id: binary_id.to_string(),
-        test_name: test_name.to_string(),
-        outcome,
-    };
     let write = || -> std::io::Result<()> {
         std::fs::create_dir_all(&dir)?;
-        std::fs::write(&tmp, serde_json::to_vec(&result)?)?;
+        std::fs::write(&tmp, serde_json::to_vec(result)?)?;
         std::fs::rename(&tmp, &path)
     };
     if let Err(e) = write() {
@@ -427,10 +441,13 @@ mod tests {
         for name in names {
             write_result(
                 tmp.path(),
-                "sample",
-                name,
-                TestOutcome::Skipped {
-                    reason: name.into(),
+                &TestResult {
+                    binary_id: "sample".into(),
+                    test_name: name.into(),
+                    outcome: TestOutcome::Skipped {
+                        reason: name.into(),
+                    },
+                    aggregate_error: None,
                 },
             );
         }
@@ -534,11 +551,14 @@ mod tests {
         let results = tmp.path();
         write_result(
             results,
-            "my-crate::tests",
-            "math::adds",
-            TestOutcome::Collected {
-                functions: vec!["adds".into()],
-                profile_count: 2,
+            &TestResult {
+                binary_id: "my-crate::tests".into(),
+                test_name: "math::adds".into(),
+                outcome: TestOutcome::Collected {
+                    functions: vec!["adds".into()],
+                    profile_count: 2,
+                },
+                aggregate_error: Some("optional aggregate failed".into()),
             },
         );
 
@@ -549,6 +569,10 @@ mod tests {
         let parsed: TestResult = serde_json::from_str(&raw).unwrap();
         assert_eq!(parsed.binary_id, "my-crate::tests");
         assert_eq!(parsed.test_name, "math::adds");
+        assert_eq!(
+            parsed.aggregate_error.as_deref(),
+            Some("optional aggregate failed")
+        );
         match parsed.outcome {
             TestOutcome::Collected {
                 functions,

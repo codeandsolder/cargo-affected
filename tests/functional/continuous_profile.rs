@@ -1,6 +1,6 @@
 #![cfg(target_os = "linux")]
 
-use std::{fs, path::Path};
+use std::{fs, path::Path, process::Command};
 
 use crate::{
     assert_no_staging_dirs, cargo_affected, combined_output, git, init_git_with_initial_commit,
@@ -92,16 +92,23 @@ fn unrelated() { assert_eq!(1 + 1, 2); }
 }
 
 #[test]
-fn killed_environment_isolated_child_selects_its_caller() {
+fn killed_environment_isolated_child_keeps_exact_coverage_and_selects_its_caller() {
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path();
     write_project(root);
+    let profile = root.join("target/aggregate.profdata");
+    let info = root.join("target/build.json");
+    fs::create_dir(root.join("target")).unwrap();
     let result = cargo_affected(
         root,
         &[
             "affected",
             "collect",
             "--continuous",
+            "--aggregate-profile",
+            profile.to_str().unwrap(),
+            "--build-info-json",
+            info.to_str().unwrap(),
             "--",
             "--no-fail-fast",
         ],
@@ -113,6 +120,36 @@ fn killed_environment_isolated_child_selects_its_caller() {
         "{log}"
     );
     assert_no_staging_dirs(root, "continuous collect");
+    let build: serde_json::Value = serde_json::from_slice(&fs::read(info).unwrap()).unwrap();
+    let meta = &build["rust-build-meta"];
+    let target = meta["target-directory"].as_str().unwrap();
+    let daemon = meta["non-test-binaries"]
+        .as_object()
+        .unwrap()
+        .values()
+        .flat_map(|bins| bins.as_array().unwrap())
+        .find(|bin| bin["name"] == "daemon")
+        .unwrap()["path"]
+        .as_str()
+        .unwrap();
+    let binary = Path::new(target).join(daemon);
+    let output = Command::new(crate::aggregate_profile::llvm_tool("llvm-cov"))
+        .arg("export")
+        .arg(binary)
+        .arg("--instr-profile")
+        .arg(&profile)
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{}", combined_output(&output));
+    let coverage: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let function = coverage["data"][0]["functions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|f| f["name"].as_str().unwrap().contains("daemon_work"))
+        .unwrap();
+    assert_eq!(function["count"], 2, "{function}");
+
     replace_in_file(
         &root.join("src/logic.rs"),
         "black_box(42)",

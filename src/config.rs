@@ -141,6 +141,8 @@ pub(crate) fn config_rule_hits(
     project: &ProjectRoot,
     build_args: &[String],
     changed_paths: &BTreeSet<String>,
+    rustflags: Option<&crate::profile::InstrumentFlags>,
+    build_dir: Option<&Path>,
 ) -> Result<BTreeMap<String, BTreeSet<TestId>>> {
     let rules =
         AffectedConfig::from_metadata(&project.metadata, &project.workspace_root)?.compile()?;
@@ -154,6 +156,8 @@ pub(crate) fn config_rule_hits(
         build_args,
         &rules,
         changed_paths,
+        rustflags,
+        build_dir,
     )
 }
 
@@ -209,6 +213,8 @@ pub(crate) fn resolve_config_hits(
     build_args: &[String],
     rules: &[CompiledRule],
     changed_paths: &BTreeSet<String>,
+    rustflags: Option<&crate::profile::InstrumentFlags>,
+    build_dir: Option<&Path>,
 ) -> Result<BTreeMap<String, BTreeSet<TestId>>> {
     let mut out: BTreeMap<String, BTreeSet<TestId>> = BTreeMap::new();
     let listing_args = args_without_filtersets(build_args);
@@ -230,8 +236,8 @@ pub(crate) fn resolve_config_hits(
         }
         let listing = nextest_list(
             project_root,
-            None,
-            None,
+            rustflags,
+            build_dir,
             &listing_args,
             Some(&rule.filterset),
         )
