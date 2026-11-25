@@ -17,7 +17,7 @@
 //! as before, with no extra `nextest list` invocation.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::path::Path;
+use std::path::{Component, Path, PathBuf};
 
 use anyhow::{Context, Result};
 use globset::{Glob, GlobSet, GlobSetBuilder};
@@ -141,6 +141,8 @@ pub(crate) fn config_rule_hits(
     project: &ProjectRoot,
     build_args: &[String],
     changed_paths: &BTreeSet<String>,
+    rustflags: Option<&crate::profile::InstrumentFlags>,
+    build_dir: Option<&Path>,
 ) -> Result<BTreeMap<String, BTreeSet<TestId>>> {
     let rules =
         AffectedConfig::from_metadata(&project.metadata, &project.workspace_root)?.compile()?;
@@ -154,6 +156,8 @@ pub(crate) fn config_rule_hits(
         build_args,
         &rules,
         changed_paths,
+        rustflags,
+        build_dir,
     )
 }
 
@@ -209,6 +213,8 @@ pub(crate) fn resolve_config_hits(
     build_args: &[String],
     rules: &[CompiledRule],
     changed_paths: &BTreeSet<String>,
+    rustflags: Option<&crate::profile::InstrumentFlags>,
+    build_dir: Option<&Path>,
 ) -> Result<BTreeMap<String, BTreeSet<TestId>>> {
     let mut out: BTreeMap<String, BTreeSet<TestId>> = BTreeMap::new();
     let listing_args = args_without_filtersets(build_args);
@@ -216,13 +222,8 @@ pub(crate) fn resolve_config_hits(
         let matched: Vec<&String> = changed_paths
             .iter()
             .filter(|p| {
-                // The rule's globs are relative to Cargo's workspace, while
-                // the selector stores Git-root-relative paths. Keep the
-                // original Git path as the reason key for the JSON report.
-                Path::new(p)
-                    .strip_prefix(workspace_prefix)
-                    .ok()
-                    .is_some_and(|relative| rule.matcher.is_match(relative))
+                rule.matcher
+                    .is_match(workspace_relative(Path::new(p), workspace_prefix))
             })
             .collect();
         if matched.is_empty() {
@@ -230,8 +231,8 @@ pub(crate) fn resolve_config_hits(
         }
         let listing = nextest_list(
             project_root,
-            None,
-            None,
+            rustflags,
+            build_dir,
             &listing_args,
             Some(&rule.filterset),
         )
@@ -273,9 +274,46 @@ pub(crate) fn resolve_config_hits(
     Ok(out)
 }
 
+/// Convert Git-root-relative paths to the rule's workspace-relative basis,
+/// including files beside or above a nested workspace.
+fn workspace_relative(path: &Path, workspace_prefix: &Path) -> PathBuf {
+    let mut workspace = workspace_prefix.components().peekable();
+    let mut file = path.components().peekable();
+    while workspace.peek().is_some() && workspace.peek() == file.peek() {
+        workspace.next();
+        file.next();
+    }
+    workspace
+        .map(|_| Component::ParentDir)
+        .chain(file)
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rules_match_paths_beside_nested_workspaces() {
+        assert_eq!(
+            workspace_relative(Path::new("shared/test.snap"), Path::new("tools/member")),
+            Path::new("../../shared/test.snap")
+        );
+        assert_eq!(
+            workspace_relative(
+                Path::new("tools/other/test.snap"),
+                Path::new("tools/member")
+            ),
+            Path::new("../other/test.snap")
+        );
+        assert_eq!(
+            workspace_relative(
+                Path::new("tools/member/src/lib.rs"),
+                Path::new("tools/member")
+            ),
+            Path::new("src/lib.rs")
+        );
+    }
 
     /// `[workspace.metadata.affected]` shape, as `cargo metadata` surfaces it.
     fn workspace_meta(rules: Value) -> Value {

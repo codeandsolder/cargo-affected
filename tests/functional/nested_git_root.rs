@@ -9,6 +9,8 @@ fn write_nested_member(repo: &Path) {
     let member = repo.join("member");
     fs::create_dir_all(member.join("src")).unwrap();
     fs::create_dir_all(member.join("fixtures")).unwrap();
+    fs::create_dir_all(repo.join("shared")).unwrap();
+    fs::write(repo.join("shared/test.snap"), "baseline\n").unwrap();
     fs::create_dir_all(member.join(".cargo")).unwrap();
     fs::write(
         repo.join(".gitignore"),
@@ -30,7 +32,7 @@ version = "0.1.0"
 edition = "2021"
 
 [[package.metadata.affected.rule]]
-globs = ["fixtures/**"]
+globs = ["fixtures/**", "../shared/**"]
 filterset = "test(/other/)"
 "#,
     )
@@ -75,6 +77,7 @@ fn nested_git_root_selects_covered_functions_and_workspace_rules() {
     write_nested_member(repo);
     init_git_with_initial_commit(repo);
     let member = repo.join("member");
+    git(repo, &["config", "diff.relative", "true"]);
 
     let collect = cargo_affected(&member, &["affected", "collect"]);
     assert!(
@@ -157,5 +160,24 @@ fn nested_git_root_selects_covered_functions_and_workspace_rules() {
         combined_output(&rule).contains("selection=1/2"),
         "workspace-relative input rule failed: {}",
         combined_output(&rule),
+    );
+    git(repo, &["checkout", "--", "member/fixtures/test.snap"]);
+    fs::write(repo.join("shared/test.snap"), "modified\n").unwrap();
+    let rule = cargo_affected(&member, &["affected", "status"]);
+    assert!(rule.status.success(), "{}", combined_output(&rule));
+    assert!(
+        combined_output(&rule).contains("selection=1/2"),
+        "sibling input rule failed: {}",
+        combined_output(&rule)
+    );
+
+    git(repo, &["checkout", "--", "shared/test.snap"]);
+    fs::write(repo.join("shared/new.snap"), "new\n").unwrap();
+    let rule = cargo_affected(&member, &["affected", "status"]);
+    assert!(rule.status.success(), "{}", combined_output(&rule));
+    assert!(
+        combined_output(&rule).contains("selection=1/2"),
+        "untracked sibling input rule failed: {}",
+        combined_output(&rule)
     );
 }

@@ -12,8 +12,8 @@
 //! runs as normal.
 
 use crate::{
-    cargo_affected, combined_output, git, git_head, init_git_with_initial_commit,
-    write_two_module_project,
+    cargo_affected, cargo_affected_with_env, combined_output, git, git_head,
+    init_git_with_initial_commit, write_two_module_project,
 };
 
 #[test]
@@ -53,6 +53,27 @@ fn run_executes_full_suite_when_no_coverage_data() {
                 .lines()
                 .any(|l| l.contains("PASS") && l.contains(t)),
             "expected nextest to PASS {t}, got:\n{combined}"
+        );
+    }
+}
+
+#[test]
+fn run_executes_full_suite_outside_a_git_repository() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    write_two_module_project(dir, "sample_cache_miss_no_git");
+    let ceiling = dir.parent().unwrap().to_string_lossy();
+    let run = cargo_affected_with_env(
+        dir,
+        &["affected", "run"],
+        &[("GIT_CEILING_DIRECTORIES", ceiling.as_ref())],
+    );
+    let output = combined_output(&run);
+    assert!(run.status.success(), "{output}");
+    for t in ["test_add", "test_multiply", "test_greet"] {
+        assert!(
+            output.lines().any(|l| l.contains("PASS") && l.contains(t)),
+            "{output}"
         );
     }
 }

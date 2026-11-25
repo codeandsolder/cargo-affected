@@ -205,17 +205,92 @@ impl BinaryStamp {
     }
 }
 
-/// One binary's function map as it travels from `collect` to the runner shim:
-/// the map itself, plus the stamp of the binary it describes.
+/// One binary's in-memory function map and the stamp of its exact build.
 ///
 /// The shim re-stamps the binary it was handed and refuses a map that doesn't
 /// match, so a rebuild between `collect`'s listing pass and the run surfaces
 /// as a skipped test rather than as coverage filed against stale lines. See
 /// [`BinaryStamp`] for why the filename can't carry that guarantee.
-#[derive(Serialize, Deserialize)]
 pub(crate) struct BinaryFunctionMap {
     pub(crate) binary: BinaryStamp,
     pub(crate) functions: FunctionMap,
+}
+
+/// Coverage map and structural sentinels for a separately built executable.
+pub(crate) struct ExecutableMap {
+    pub(crate) path: std::path::PathBuf,
+    pub(crate) map: BinaryFunctionMap,
+    pub(crate) sentinels: BTreeSet<HitRange>,
+}
+
+/// Build the inverted executable index once, not once per test. Each hit
+/// visits only the executable maps containing that name. Validate all stamps
+/// before joining any results: an unmatched rebuilt binary is unsafe too.
+pub(crate) struct ExecutableIndex<'a> {
+    maps: &'a [ExecutableMap],
+    by_name: BTreeMap<&'a str, Vec<(usize, &'a [HitRange])>>,
+}
+
+impl<'a> ExecutableIndex<'a> {
+    pub(crate) fn new(maps: &'a [ExecutableMap]) -> Result<Self> {
+        let mut by_name: BTreeMap<&str, Vec<(usize, &[HitRange])>> = BTreeMap::new();
+        for (id, executable) in maps.iter().enumerate() {
+            if BinaryStamp::of(&executable.path)? != executable.map.binary {
+                bail!(
+                    "{} was rebuilt after its executable coverage map was exported",
+                    executable.path.display()
+                );
+            }
+            for (name, ranges) in &executable.map.functions {
+                by_name.entry(name).or_default().push((id, ranges));
+            }
+        }
+        Ok(Self { maps, by_name })
+    }
+
+    /// Shared library names alone are not evidence of an executable launch.
+    /// Always union matching ranges, but attach executable sentinels only
+    /// when there is evidence for that executable, or attribution is ambiguous.
+    /// A single raw profile containing a harness-exclusive name is evidence
+    /// of the harness itself; several raw profiles may include a child that
+    /// was killed before reaching its own main, so retain ambiguous owners.
+    pub(crate) fn ranges(
+        &self,
+        executed: &[&str],
+        test_map: &FunctionMap,
+        profile_count: usize,
+    ) -> Result<BTreeSet<HitRange>> {
+        let mut ranges = matching_ranges(executed, test_map);
+        let mut matched = BTreeSet::new();
+        let mut launched = BTreeSet::new();
+        let mut harness_evidence = false;
+        for name in executed {
+            let harness = test_map.get(*name);
+            let Some(owners) = self.by_name.get(*name) else {
+                harness_evidence |= harness.is_some();
+                continue;
+            };
+            for &(id, source_ranges) in owners {
+                ranges.extend(source_ranges.iter().cloned());
+                matched.insert(id);
+                if harness.is_none_or(|h| h.as_slice() != source_ranges) {
+                    launched.insert(id);
+                }
+            }
+        }
+        if profile_count > 1 || !harness_evidence {
+            // A child may run only shared functions (e.g. killed during
+            // initialization), and exec replacement may lack a harness profile.
+            launched.extend(matched);
+        }
+        for id in launched {
+            ranges.extend(self.maps[id].sentinels.iter().cloned());
+        }
+        if ranges.is_empty() {
+            return hit_ranges(executed, test_map);
+        }
+        Ok(ranges)
+    }
 }
 
 /// Convert a relative source path into a `Utf8PathBuf` whose string form uses
@@ -228,7 +303,18 @@ pub(crate) struct BinaryFunctionMap {
 /// Windows. Returns `None` if the path isn't valid UTF-8 (paths originating
 /// from cargo/llvm-cov already are, but the call shape is still fallible).
 pub(crate) fn to_db_relative(path: &Path) -> Option<Utf8PathBuf> {
-    let utf8 = Utf8PathBuf::try_from(path.to_path_buf()).ok()?;
+    // LLVM can retain lexical `..` in #[path] modules and path dependencies.
+    // Reduce them inside the Git root; reject a path that escapes it.
+    let mut normalized = std::path::PathBuf::new();
+    for component in path.components() {
+        match component {
+            std::path::Component::Normal(part) => normalized.push(part),
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir if normalized.pop() => {}
+            _ => return None,
+        }
+    }
+    let utf8 = Utf8PathBuf::try_from(normalized).ok()?;
     if cfg!(windows) && utf8.as_str().contains('\\') {
         Some(Utf8PathBuf::from(utf8.as_str().replace('\\', "/")))
     } else {
@@ -306,6 +392,9 @@ pub(crate) fn build_function_map(
                 }
             }
         }
+    }
+    for ranges in map.values_mut() {
+        ranges.sort_unstable();
     }
     Ok(map)
 }
@@ -388,13 +477,18 @@ pub(crate) fn executed_functions(proftext: &str) -> Result<Vec<&str>> {
 /// the row count looks healthy, and the stored coverage quietly degrades to
 /// "only crate-root edits select anything" — under-selection across the whole
 /// binary, from a collect that exited 0.
-pub(crate) fn hit_ranges(executed: &[&str], map: &FunctionMap) -> Result<BTreeSet<HitRange>> {
+fn matching_ranges(executed: &[&str], map: &FunctionMap) -> BTreeSet<HitRange> {
     let mut ranges = BTreeSet::new();
     for name in executed {
         if let Some(function) = map.get(*name) {
             ranges.extend(function.iter().cloned());
         }
     }
+    ranges
+}
+
+pub(crate) fn hit_ranges(executed: &[&str], map: &FunctionMap) -> Result<BTreeSet<HitRange>> {
+    let ranges = matching_ranges(executed, map);
     if ranges.is_empty() {
         bail!(
             "none of the {} functions this test executed appear among the {} \
@@ -571,6 +665,88 @@ mod tests {
         assert!(hit_ranges(&["mine"], &FunctionMap::new()).is_err());
     }
 
+    #[test]
+    fn executable_maps_union_shared_names_and_check_stale_unmatched_binaries() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let make_map = |name: &str, symbol: &str| -> Result<ExecutableMap> {
+            let path = dir.path().join(name);
+            std::fs::write(&path, name)?;
+            let range = HitRange {
+                file: Utf8PathBuf::from(format!("src/{name}.rs")),
+                line_start: 3,
+                line_end: 6,
+            };
+            Ok(ExecutableMap {
+                map: BinaryFunctionMap {
+                    binary: BinaryStamp::of(&path)?,
+                    functions: [(symbol.to_string(), vec![range.clone()])]
+                        .into_iter()
+                        .collect(),
+                },
+                path,
+                sentinels: [HitRange::sentinel(range.file)].into_iter().collect(),
+            })
+        };
+        let maps = [
+            make_map("first", "shared")?,
+            make_map("second", "shared")?,
+            make_map("third", "unrelated")?,
+        ];
+        let result = ExecutableIndex::new(&maps)?.ranges(&["shared"], &FunctionMap::new(), 1)?;
+        assert_eq!(result.len(), 4);
+        assert!(result
+            .iter()
+            .all(|range| !range.file.as_str().contains("third")));
+        std::fs::write(&maps[2].path, "different build")?;
+        let Err(error) = ExecutableIndex::new(&maps) else {
+            panic!("stale executable accepted");
+        };
+        assert!(error.to_string().contains("rebuilt after"));
+        Ok(())
+    }
+
+    #[test]
+    fn shared_library_name_is_not_launch_evidence_in_a_single_harness_profile() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("app");
+        std::fs::write(&path, "binary")?;
+        let shared = HitRange {
+            file: Utf8PathBuf::from("src/lib.rs"),
+            line_start: 3,
+            line_end: 6,
+        };
+        let own = HitRange {
+            file: Utf8PathBuf::from("tests/caller.rs"),
+            line_start: 1,
+            line_end: 4,
+        };
+        let sentinel = HitRange::sentinel(Utf8PathBuf::from("src/main.rs"));
+        let maps = [ExecutableMap {
+            map: BinaryFunctionMap {
+                binary: BinaryStamp::of(&path)?,
+                functions: [("shared".into(), vec![shared.clone()])]
+                    .into_iter()
+                    .collect(),
+            },
+            path,
+            sentinels: [sentinel.clone()].into_iter().collect(),
+        }];
+        let harness: FunctionMap = [
+            ("shared".into(), vec![shared.clone()]),
+            ("caller".into(), vec![own.clone()]),
+        ]
+        .into_iter()
+        .collect();
+        let index = ExecutableIndex::new(&maps)?;
+        let direct = index.ranges(&["shared", "caller"], &harness, 1)?;
+        assert_eq!(direct, [shared.clone(), own].into_iter().collect());
+        assert!(index
+            .ranges(&["shared", "caller"], &harness, 2)?
+            .contains(&sentinel));
+        assert!(index.ranges(&["shared"], &harness, 1)?.contains(&sentinel));
+        Ok(())
+    }
+
     /// The `--text` profile shape llvm-profdata emits: labelled sections, one
     /// blank-separated record per function. Only functions with a non-zero
     /// counter come back.
@@ -678,6 +854,28 @@ _RNvC5probe12never_called
 #[cfg(test)]
 mod git_root_path_tests {
     use super::*;
+
+    #[test]
+    fn normalizes_parent_components_without_leaving_git_root() {
+        let root = Path::new("/repo");
+        let workspace = root.join("member");
+        assert_eq!(
+            to_git_relative(
+                &workspace.join("../shared/logic.rs"),
+                &workspace,
+                root,
+                Path::new("member")
+            ),
+            Some(Utf8PathBuf::from("shared/logic.rs"))
+        );
+        assert!(to_git_relative(
+            &workspace.join("../../outside.rs"),
+            &workspace,
+            root,
+            Path::new("member")
+        )
+        .is_none());
+    }
 
     #[test]
     fn workspace_paths_use_gits_spelling_instead_of_windows_short_name() {

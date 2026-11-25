@@ -66,22 +66,69 @@ HEAD` resolves either way and stored ranges live in the sha's coordinate
 system. `cargo affected run` is therefore a strict superset of `cargo
 nextest run`: always at least as safe.
 
+## Collect, compare, and report from the same full test execution
+
+For shadow-mode adoption, `collect` can predict affected tests from the
+previous database **before** replacing it with a fresh full-suite baseline:
+
+```sh
+cargo affected collect --report-json target/selection.json --report-detail full -- --no-fail-fast
+```
+
+The selection is advisory: every admitted Nextest test still runs. The report
+uses the instrumented test listing already prepared for collection, and
+configuration rules use the same build directory and flags.
+
+Add `--aggregate-profile target/coverage.profdata` to export an indexed LLVM
+profile of the same full run. This uses each test's existing LLVM counters,
+compacts them into bounded batches, and publishes the profile only when the
+full run succeeds and the aggregate is complete. An existing output file is
+removed before collection starts so a failed run cannot leave a stale report.
+If the requested aggregate cannot be published, collection exits non-zero
+without discarding the per-test baseline. A failing test run retains its
+Nextest exit code. Use a dedicated output path for each concurrent collect.
+The profile can be used with
+`llvm-cov export` or `llvm-cov show`
+against the instrumented executables in `target/affected/build`; no second
+test execution is necessary. `--build-info-json PATH` additionally exports
+Nextest’s actual target and build directories for external reporting tools.
+Neither full-suite output option is accepted with `--diff`, since an incremental run is not a fresh full-suite report.
+
+For multiple independently configured suites in a CI job, use a distinct
+global `--state-dir` for each build/filter scope. It selects the database,
+instrumented build, and temporary staging directory together, without
+modifying Cargo's usual target directory. Relative paths are resolved from
+the workspace root. Choose a directory ignored by Git or outside the
+checkout; otherwise generated files will make the next collect see a dirty
+working tree. Separate instrumented build directories also permit independent
+concurrent scopes without replacing each other's binaries. Use the same
+directory for `collect`, `run`, `status`, and `clean`. The default remains `target/affected`.
+
+```sh
+cargo affected collect --state-dir target/affected-unit -- --lib
+cargo affected collect --state-dir target/affected-integration -- --test integration
+cargo affected status --state-dir target/affected-unit -- --lib
+```
+
 ## How it works
 
 `collect`:
 
 1. `cargo nextest list` enumerates every test.
-2. `llvm-cov export` reads each test binary's coverage map once — where every
+2. `llvm-cov export` reads each test binary and Cargo-built executable's coverage map once — where every
    instrumented function lives in the source. That doesn't vary per test, and
    it's the expensive part.
 3. `cargo nextest run` runs the tests with `-C instrument-coverage` and a
    per-test `LLVM_PROFILE_FILE`.
-4. For each test, `llvm-profdata` merges its profraw into the list of
-   functions it executed, and those are looked up in the map from step 2.
+4. Each test shim merges its raw profiles with `llvm-profdata`, verifies
+   the binary stamp, writes the executed names, and removes the raw profiles.
+   The collector streams those results and looks up names in the in-memory
+   harness maps and one executable index.
 5. Per `(test, file, function)`, the min/max line span is stored in
    `target/affected/coverage.db` (SQLite), keyed by a fingerprint of
-   `Cargo.lock`, all workspace `Cargo.toml`s, `rustc -vV`, `RUSTFLAGS`, and
-   `CARGO_BUILD_TARGET`. The git HEAD sha is recorded alongside.
+   `Cargo.lock`, all workspace `Cargo.toml`s, `rustc -vV`, `RUSTFLAGS`, `CARGO_ENCODED_RUSTFLAGS`, and
+   `CARGO_BUILD_TARGET`, and the coverage-mapping/persistence-mode version.
+   The git HEAD sha is recorded alongside.
 
 `run`:
 
@@ -96,6 +143,61 @@ nextest run`: always at least as safe.
    edit to a crate root reselects every test in that target, every test in
    the same package that links the lib (bins, integration tests), and every
    test in workspace packages that transitively depend on it.
+
+## Executable subprocess coverage
+
+Coverage collection uses Nextest's build metadata to include separately built
+Cargo executables (including `test = false` binaries). Tests and their
+instrumented descendants write LLVM profiles into the same test-specific
+directory. Function hits from those executables are attributed to the test
+that launched them, including grandchildren; crate-root dependencies are
+included when an executable launch is evidenced or the profile is ambiguous.
+Identical function names in multiple maps are conservatively unioned rather
+than assigned arbitrarily. A direct library call in a single harness profile
+does not acquire the executable's structural sentinel just because the
+executable links the same library. Multiple raw profiles can include a
+child killed before its own entry point; ambiguous matches retain sentinels.
+The executable index is built once per collection, not parsed in each
+runner shim. Existing baselines require a fresh collect when the mapping
+version changes.
+
+The executable must be built with coverage instrumentation and be identified
+in Nextest's build metadata. Descendants must inherit the per-test
+`LLVM_PROFILE_FILE` and flush their counters before the test ends. An
+executable built separately during the test, a process that discards the
+profile environment, or a daemon killed before it flushes cannot provide
+complete per-test coverage through this mechanism. Use explicit input rules
+for those cases until they can be instrumented and made to flush.
+
+### Retain coverage after forced process termination
+
+On native Linux, use `cargo affected collect --continuous -- ...` to build
+with LLVM counter relocation and map counters into per-test raw profiles.
+A dependency-free capability probe verifies that the current toolchain
+actually persists counters after forced termination before starting collection.
+Use `--continuous` for `status`, `run`, and incremental collection against
+that database. Exit-mode and continuous-mode fingerprints are distinct.
+
+If a test sanitizes a subprocess environment with `Command::env_clear()`,
+explicitly preserve only the profiling destination when it is present:
+
+```rust
+let mut command = std::process::Command::new(executable);
+command.env_clear();
+if let Some(profile) = std::env::var_os("LLVM_PROFILE_FILE") {
+    command.env("LLVM_PROFILE_FILE", profile);
+}
+// Add the test's ordinary allowlisted environment here.
+```
+
+The LLVM runtime itself may set `__LLVM_PROFILE_RT_INIT_ONCE` during startup.
+Do not reintroduce the entire parent environment. The profiling destination
+must be accessible to the child, including inside any sandbox, and all
+descendants must stop before their test's coverage is consumed. Continuous
+mode captures counters before SIGKILL, abort, or other abrupt termination;
+it does not infer the test identity of a process that deliberately removes
+all inherited profiling context. Keep explicit input rules or separate full
+test gates for opaque subprocesses (including privilege-boundary cases).
 
 ## Accuracy model
 
@@ -123,7 +225,7 @@ CI should still run the full suite.
   llvm-cov — a change confined to one selects no test. [Input
   rules](#input-rules) close this for inputs you can name.
 - **Build-time inputs not in the fingerprint.** The fingerprint covers
-  `Cargo.lock`, workspace `Cargo.toml`s, `rustc -vV`, `RUSTFLAGS`, and
+  `Cargo.lock`, workspace `Cargo.toml`s, `rustc -vV`, `RUSTFLAGS`, `CARGO_ENCODED_RUSTFLAGS`, and
   `CARGO_BUILD_TARGET`. Changes to `build.rs`, `rust-toolchain.toml`, or
   `.cargo/config.toml` don't currently invalidate the cache.
 - **Proc-macro crate source.** A proc-macro's own source files compile into
