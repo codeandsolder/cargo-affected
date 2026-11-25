@@ -14,7 +14,7 @@ permissions:
 
 jobs:
   sync:
-    uses: codeandsolder/ci-workflows/.github/workflows/upstream-tracking.yml@bf0a56b897a722e474561d94dcb12485f1e14e41
+    uses: codeandsolder/ci-workflows/.github/workflows/upstream-tracking.yml@7df510a2053e220c010c331b5daef81a593a19bb
     with:
       upstream-repository: max-sixty/cargo-affected
       upstream-branch: main
