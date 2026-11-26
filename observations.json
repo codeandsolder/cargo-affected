@@ -1,10 +1,14 @@
 {
   "source": "max-sixty/cargo-affected:main",
-  "lastAttempt": 1795706874892,
+  "lastAttempt": 1795706877570,
   "observations": [
     {
       "sha": "4525dace7fd8b90dfd7a86e2bea5bb9e3c6314cc",
       "firstObserved": 1795470599075
+    },
+    {
+      "sha": "13f86fbe16a27921797d3100a7648c860276bace",
+      "firstObserved": 1795706877570
     }
   ]
 }
